@@ -1,0 +1,249 @@
+#!/bin/bash
+# hmail —— 邮件发送端口（WSL bash -> Windows 侧 Hermes 发信脚本）
+#
+# 两条通道：
+#   1) HTML 通道（默认，无附件）：D:\hermes\profiles\finance\scripts\send_mail.py
+#      —— 默认 --html auto：正文经 mail_html.render_text 包成统一 HTML 外观，
+#         multipart/alternative 里保留纯文本兜底；也支持 --html none / --html <自定义 HTML 文件>。
+#   2) 纯文本通道（有附件时）：D:\hermes\scripts\send-mail.py
+#      —— finance 的 send_mail.py 不支持附件；因此 --attach 时自动改走这条老通道，
+#         跳过 HTML 排版（stderr 明确提示）。
+#
+# 设计目标：把 Hermes 的发信通道（脚本自读凭据，收件人=发件人）变成 agent 会话里可
+# 直接调用的 bash 端口，不读凭据、不改脚本、退出码透传。
+#
+# 关键点：
+#   * 正文一律由 WSL 侧读出后经 stdin 交给 Windows Python（-X utf8），绕开 Windows
+#     命令行长度限制和跨文件系统路径问题；--body-file 支持 Linux 路径与 Windows 路径。
+#   * --html <文件> 与 --attach 同理：/mnt/<盘>/... 直接转 Windows 路径；WSL 内部文件系统
+#     （/root、/tmp…）先复制到唯一 Windows 临时目录（C:\Windows\Temp\hmail.XXXXXX），
+#     结束（含失败/中断）由 trap 清理。
+#   * 不读、不打印、不落盘任何凭据；凭据只由 Hermes 发信脚本自己读。
+#   * 退出码：0 成功；1 发送失败；2 参数/正文问题；127 依赖缺失。
+#
+# 用法见 usage()；完整实测记录见同目录 findings-tool-port.md。
+
+set -u
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
+WINPY_LINUX="${HTOOLS_WINPY:-/mnt/d/hermes/tools/vizenv/Scripts/python.exe}"
+MAIL_HTML_LINUX="${HTOOLS_SEND_MAIL_HTML:-/mnt/d/hermes/profiles/finance/scripts/send_mail.py}"
+MAIL_TEXT_LINUX="${HTOOLS_SEND_MAIL:-/mnt/d/hermes/scripts/send-mail.py}"
+WIN_TMP_ROOT="${HTOOLS_WIN_TMP:-/mnt/c/Windows/Temp}"
+
+usage() {
+  cat <<'EOF'
+用法: hmail --subject <标题> [--body <正文> | --body-file <文件>] [--html auto|none|<文件>] [--attach <路径>]... [--test]
+
+  --subject  标题（必填，UTF-8）
+  --body     正文（短正文；长正文建议用 stdin 或 --body-file）
+  --body-file 正文文件（Linux 或 Windows 路径均可）；内容以 UTF-8 读出后经 stdin 发送
+  --html     auto（默认，Hermes 统一 HTML 外观 + 纯文本兜底）| none（纯文本）|
+             <文件>（自定义 HTML，Linux/Windows 路径均可；WSL 内部文件自动复制到
+             Windows 临时目录后传入）
+  --attach   附件，可重复；Linux 或 Windows 路径均可。WSL 内部文件会自动复制到
+             Windows 临时目录并在结束后清理。
+             注意：附件模式自动改走纯文本通道（finance send_mail.py 不支持附件），
+             --html 会被忽略并在 stderr 提示“附件模式跳过 HTML 排版”。
+  --test     透传脚本：标题自动加 “[测试] ” 前缀
+  -h, --help 本帮助
+
+正文来源：--body 与 --body-file 互斥（同时给报参数错误）；都不给时读 stdin（非 TTY）。
+收件人固定为发件人本人（脚本内置），没有 --to 参数；凭据由 Hermes 发信脚本自读，本端口不接触。
+
+通道选择：
+  无 --attach  → D:\hermes\profiles\finance\scripts\send_mail.py（HTML：--html auto/none/<文件>）
+  有 --attach  → D:\hermes\scripts\send-mail.py（纯文本 + 附件；跳过 HTML）
+
+示例:
+  hmail --subject "报告已生成" --body "正文摘要"
+  hmail --subject "日报" --body-file /root/notes/daily.md          # 默认 HTML=auto
+  echo "长正文……" | hmail --subject "日报" --html none              # 纯文本
+  hmail --subject "告警" --body "见附件" --attach /mnt/d/hermes/work/report.md
+
+退出码: 0 成功 | 2 参数/正文问题 | 1 发送失败 | 127 依赖缺失
+EOF
+}
+
+die() { local rc="$1"; shift; printf 'hmail: %s\n' "$*" >&2; exit "$rc"; }
+
+is_winpath() {
+  case "$1" in
+    [A-Za-z]:[\\/]*|[A-Za-z]:|\\\\*|//*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Linux 路径（绝对/相对）-> Windows 路径。已是 Windows 形式则原样返回。
+to_win() {
+  local p="$1" abs w
+  if is_winpath "$p"; then printf '%s' "$p"; return 0; fi
+  if [[ "$p" == /* ]]; then abs="$p"; else abs="$PWD/$p"; fi
+  if command -v realpath >/dev/null 2>&1; then
+    abs="$(realpath -m -- "$abs" 2>/dev/null || printf '%s' "$abs")"
+  fi
+  if command -v wslpath >/dev/null 2>&1; then
+    w="$(wslpath -w "$abs" 2>/dev/null)" && [[ -n "$w" ]] && { printf '%s' "$w"; return 0; }
+  fi
+  if [[ "$abs" =~ ^/mnt/([a-zA-Z])(/.*)?$ ]]; then
+    local d="${BASH_REMATCH[1]^^}" rest="${BASH_REMATCH[2]:-}"
+    printf '%s:/%s' "$d" "${rest#/}"
+  else
+    printf '%s' "$abs"
+  fi
+}
+
+# Windows 路径 -> Linux 路径；Linux 路径原样（相对路径按当前 PWD 绝对化）。
+to_linux() {
+  local p="$1" w
+  if ! is_winpath "$p"; then
+    if [[ "$p" == /* ]]; then printf '%s' "$p"; else printf '%s/%s' "$PWD" "$p"; fi
+    return 0
+  fi
+  if command -v wslpath >/dev/null 2>&1; then
+    w="$(wslpath -u "$p" 2>/dev/null)" && [[ -n "$w" ]] && { printf '%s' "$w"; return 0; }
+  fi
+  printf '%s' "$p"
+}
+
+# ---- 解析参数（无位置参数） ----
+subject=""; body=""; body_file=""; html_arg=""
+have_body=0; have_body_file=0; html_given=0; test_flag=0
+attaches=()
+while (($# > 0)); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --subject)
+      (($# >= 2)) || die 2 "--subject 需要一个值"
+      subject="$2"; shift 2 ;;
+    --subject=*) subject="${1#*=}"; shift ;;
+    --body)
+      (($# >= 2)) || die 2 "--body 需要一个值"
+      body="$2"; have_body=1; shift 2 ;;
+    --body=*) body="${1#*=}"; have_body=1; shift ;;
+    --body-file)
+      (($# >= 2)) || die 2 "--body-file 需要一个值"
+      body_file="$2"; have_body_file=1; shift 2 ;;
+    --body-file=*) body_file="${1#*=}"; have_body_file=1; shift ;;
+    --html)
+      (($# >= 2)) || die 2 "--html 需要一个值（auto/none 或 HTML 文件路径）"
+      html_arg="$2"; html_given=1; shift 2 ;;
+    --html=*) html_arg="${1#*=}"; html_given=1; shift ;;
+    --attach)
+      (($# >= 2)) || die 2 "--attach 需要一个值"
+      attaches+=("$2"); shift 2 ;;
+    --attach=*) attaches+=("${1#*=}"); shift ;;
+    --test) test_flag=1; shift ;;
+    --) shift; break ;;
+    -*) die 2 "未知选项：$1（用 -h 看用法）" ;;
+    *) die 2 "多余的位置参数：$1（正文请用 --body/--body-file 或 stdin）" ;;
+  esac
+done
+(($# == 0)) || die 2 "多余的位置参数：$*"
+[[ -n "$subject" ]] || die 2 "缺少 --subject（标题不能为空）"
+((have_body + have_body_file <= 1)) || die 2 "--body 与 --body-file 只能给一个"
+((html_given == 0)) || [[ -n "$html_arg" ]] || die 2 "--html 不能为空（用 auto/none 或 HTML 文件路径）"
+
+# ---- 通道选择与依赖检查 ----
+if ((${#attaches[@]} > 0)); then
+  channel="text"
+  MAIL_LINUX="$(to_linux "$MAIL_TEXT_LINUX")"
+  [[ -f "$MAIL_LINUX" ]] || die 127 "找不到纯文本发信脚本：$MAIL_LINUX（可用 HTOOLS_SEND_MAIL 覆盖）"
+  printf 'hmail: 注意：附件模式跳过 HTML 排版（改用纯文本通道 %s；finance send_mail.py 不支持附件）。\n' \
+    "$MAIL_TEXT_LINUX" >&2
+  if ((html_given)); then
+    printf 'hmail: 注意：--html %s 在附件模式下被忽略。\n' "$html_arg" >&2
+  fi
+else
+  channel="html"
+  MAIL_LINUX="$(to_linux "$MAIL_HTML_LINUX")"
+  [[ -f "$MAIL_LINUX" ]] || die 127 "找不到 HTML 发信脚本：$MAIL_LINUX（可用 HTOOLS_SEND_MAIL_HTML 覆盖）"
+fi
+WINPY_LINUX="$(to_linux "$WINPY_LINUX")"
+[[ -x "$WINPY_LINUX" ]] || die 127 "找不到可执行的 Windows Python：$WINPY_LINUX（可用 HTOOLS_WINPY 覆盖）"
+MAIL_WIN="$(to_win "$MAIL_LINUX")"
+
+tmpdir=""
+cleanup() { if [[ -n "$tmpdir" && -d "$tmpdir" ]]; then rm -rf -- "$tmpdir"; fi; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+ensure_tmp() {
+  if [[ -z "$tmpdir" ]]; then
+    tmpdir="$(mktemp -d "$WIN_TMP_ROOT/hmail.XXXXXX")" \
+      || die 2 "无法在 Windows 临时目录创建目录：$WIN_TMP_ROOT"
+  fi
+}
+
+# 把一个 WSL 侧文件准备成 Windows 侧可读路径：
+#   /mnt/<盘>/... 直接转换；WSL 内部文件（/root、/tmp…）复制到本次唯一临时目录。
+# 结果放在 PREP_WIN（不用命令替换，保证 cp 失败时 die 能真正退出主进程）。
+PREP_WIN=""
+prep_file_for_windows() {
+  local lin="$1" base
+  case "$lin" in
+    /mnt/[A-Za-z]/*)
+      PREP_WIN="$(to_win "$lin")" ;;
+    *)
+      ensure_tmp
+      base="$(basename -- "$lin")"
+      cp -f -- "$lin" "$tmpdir/$base" || die 2 "复制文件到 Windows 临时目录失败：$lin"
+      PREP_WIN="$(to_win "$tmpdir/$base")" ;;
+  esac
+}
+
+# ---- 正文：优先 WSL 侧读出 -> stdin ----
+body_text=""
+if ((have_body)); then
+  body_text="$body"
+elif ((have_body_file)); then
+  body_lin="$(to_linux "$body_file")"
+  [[ -f "$body_lin" ]] || die 2 "正文文件不存在：$body_file（解析为 $body_lin）"
+  body_text="$(cat -- "$body_lin")" || die 2 "读取正文文件失败：$body_lin"
+elif [[ ! -t 0 ]]; then
+  body_text="$(cat)"
+else
+  die 2 "缺正文：用 --body、--body-file，或从 stdin 传入"
+fi
+[[ -n "${body_text//[[:space:]]/}" ]] || die 2 "正文为空，未发送"
+
+# ---- 组装 argv ----
+mail_args=(--subject "$subject")
+((test_flag)) && mail_args+=(--test)
+
+if [[ "$channel" == "html" ]]; then
+  if ((html_given)); then
+    html_lc="${html_arg,,}"
+    if [[ "$html_lc" == "auto" || "$html_lc" == "none" ]]; then
+      mail_args+=(--html "$html_lc")
+    else
+      html_lin="$(to_linux "$html_arg")"
+      [[ -f "$html_lin" ]] || die 2 "--html 文件不存在：$html_arg（解析为 $html_lin）"
+      prep_file_for_windows "$html_lin"
+      mail_args+=(--html "$PREP_WIN")
+    fi
+  else
+    mail_args+=(--html auto)          # finance send_mail.py 的默认值，显式写出便于审计
+  fi
+else
+  # 纯文本通道（D:\hermes\scripts\send-mail.py）：附件直接传 Windows 路径
+  for src in "${attaches[@]}"; do
+    src_lin="$(to_linux "$src")"
+    [[ -f "$src_lin" ]] || die 2 "附件不存在：$src（解析为 $src_lin）"
+    prep_file_for_windows "$src_lin"
+    mail_args+=(--attach "$PREP_WIN")
+  done
+fi
+
+# ---- 调 Windows 发信脚本：正文走 stdin，参数走 argv ----
+# UTF-8 强制用 -X utf8：Windows Python 在管道下默认用 GBK 解 stdin，会把中文正文读坏；
+# 而 WSL 的环境变量默认不会传给 Windows 进程，export PYTHONIOENCODING 实测无效。
+# 同时过滤 Windows 文本模式产生的 CR（只影响回执/错误显示，正文走 stdin 不受影响）。
+printf '%s' "$body_text" | "$WINPY_LINUX" -X utf8 "$MAIL_WIN" "${mail_args[@]}" \
+  2> >(tr -d '\r' >&2) | tr -d '\r'
+rc=${PIPESTATUS[1]}
+cleanup
+tmpdir=""
+exit "$rc"

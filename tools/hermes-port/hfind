@@ -1,0 +1,191 @@
+#!/bin/bash
+# hfind —— Everything 文件检索端口（WSL bash -> Windows Everything CLI）
+#
+# 设计目标：在任意 Linux cwd（含 /、/root 这类非 /mnt 目录）下稳定调用 Windows 侧
+# D:\hermes\scripts\everything-search.py（它再调 D:\HermesTools\tools\es.exe）。
+#
+# 关键点：
+#   * 路径参数自动 /mnt/d/xxx -> D:\xxx（Windows 路径原样保留；相对路径按“调用者当时的
+#     PWD”先绝对化，因此切换 cwd 不影响解析结果）。
+#   * 输出 UTF-8 正常（Windows Python 加 -X utf8 + 包装器自身 reconfigure；并过滤 CRLF）。
+#   * 先把 cwd 切到 Windows 盘上的目录再启动 exe，避免 WSL 启动 Windows 程序时
+#     “UNC 路径不受支持”的 cwd 警告/怪异行为；脚本/参数全部用 Windows 绝对路径。
+#   * 退出码透传 Windows Python 包装器：0 成功，2 参数错误，3 Everything 实例不可达，
+#     4 es.exe 调用失败；本端口自身依赖缺失用 127。
+#   * 不写 /mnt 下 Hermes 目录：实例探测缓存默认放 Windows 临时目录（可覆盖）。
+#
+# 用法见 usage()；完整实测记录见同目录 findings-tool-port.md。
+
+set -u
+
+# 隔离环境（HOME=stateDir、PATH 只有 worker-bin）下也能找到 coreutils。
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
+WINPY_LINUX="${HTOOLS_WINPY:-/mnt/d/hermes/tools/vizenv/Scripts/python.exe}"
+SEARCH_LINUX="${HTOOLS_EVERYTHING_SEARCH:-/mnt/d/hermes/scripts/everything-search.py}"
+# 包装器自带的实例探测缓存；默认落到 Windows 临时目录，避免写 /mnt/d/hermes/cache。
+export ES_INSTANCE_CACHE="${ES_INSTANCE_CACHE:-C:/Windows/Temp/.hfind-es-instance.json}"
+# 注意：WSL 的普通环境变量不会自动传给 Windows 进程，必须列进 WSLENV 才会被透传。
+export WSLENV="${WSLENV:+$WSLENV:}ES_INSTANCE_CACHE:ES_EXE:ES_INSTANCE"
+
+usage() {
+  cat <<'EOF'
+用法: hfind <query> [选项...]
+
+  query 是 Everything 查询语法（默认子串/通配，不按正则解释；正则请加 --regex）。
+  没有 query 时仍可用 --path/--parent/--count/--total-size 等做统计；完全不给参数则报错。
+
+常用选项（透传 everything-search.py）:
+  -n, --limit N       最多返回 N 条（默认 50）
+  --path DIR          限定目录（递归）。Linux /mnt/d/... 或 Windows D:/... 均可，自动转换
+  --parent DIR        只列该目录的直接子项
+  --regex             查询按正则解释（内部转成 Everything 的 regex: 前缀；
+                      不用包装器 --regex，因其 -regex 开关在 es 1.1.0.38 下失效）
+  --dirs              只列文件夹（默认只列文件）
+  --all               文件和文件夹都列
+  --size              输出大小：human<TAB>bytes<TAB>path
+  --offset N          跳过前 N 条
+  --sort KEY          name|path|size|extension|modified|created|run-count
+  --asc               升序（默认降序）
+  --count             只输出命中数（stdout 一个整数）
+  --total-size        只输出结果总体积（stdout: bytes<TAB>human）
+  --json              单行 JSON
+  --case              区分大小写
+  --instance NAME     覆盖 Everything 实例名（默认自动探测）
+  --es PATH           覆盖 es.exe 路径
+  --list-instances    打印 es.exe 与实例探测结果后退出
+  -h, --help          本帮助
+
+示例:
+  hfind "口腔" -n 5
+  hfind "*.pdf" --path D:/hermes --count
+  hfind "*.pdf" --path /mnt/d/hermes --json -n 5
+  hfind --parent /mnt/d/hermes --dirs --size -n 20
+
+退出码: 0 成功 | 2 参数错误/包装器拒绝 | 3 Everything 实例不可达 | 4 es.exe 调用失败 | 127 依赖缺失
+环境变量: HTOOLS_WINPY（Windows Python）, HTOOLS_EVERYTHING_SEARCH（包装器）, ES_INSTANCE_CACHE
+EOF
+}
+
+die() { # die <exit-code> <message>
+  local rc="$1"; shift
+  printf 'hfind: %s\n' "$*" >&2
+  exit "$rc"
+}
+
+is_winpath() {
+  case "$1" in
+    [A-Za-z]:[\\/]*|[A-Za-z]:|\\\\*|//*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Linux 路径（绝对/相对）-> Windows 路径。已是 Windows 形式则原样返回。
+to_win() {
+  local p="$1" abs w
+  if is_winpath "$p"; then printf '%s' "$p"; return 0; fi
+  if [[ "$p" == /* ]]; then abs="$p"; else abs="$PWD/$p"; fi
+  if command -v realpath >/dev/null 2>&1; then
+    abs="$(realpath -m -- "$abs" 2>/dev/null || printf '%s' "$abs")"
+  fi
+  if command -v wslpath >/dev/null 2>&1; then
+    w="$(wslpath -w "$abs" 2>/dev/null)" && [[ -n "$w" ]] && { printf '%s' "$w"; return 0; }
+  fi
+  # 无 wslpath 时的手工回退：/mnt/<盘符>/...
+  if [[ "$abs" =~ ^/mnt/([a-zA-Z])(/.*)?$ ]]; then
+    local d="${BASH_REMATCH[1]^^}" rest="${BASH_REMATCH[2]:-}"
+    printf '%s:/%s' "$d" "${rest#/}"
+  else
+    printf '%s' "$abs"
+  fi
+}
+
+# Windows 路径 -> Linux 路径（用于 -x 检查等；es 侧不需要）。
+to_linux() {
+  local p="$1"
+  if ! is_winpath "$p"; then
+    if [[ "$p" == /* ]]; then printf '%s' "$p"; else printf '%s/%s' "$PWD" "$p"; fi
+    return 0
+  fi
+  if command -v wslpath >/dev/null 2>&1; then
+    wslpath -u "$p" 2>/dev/null && return 0
+  fi
+  printf '%s' "$p"
+}
+
+if (($# == 0)); then
+  usage >&2
+  printf 'hfind: 缺少 query/选项（至少给一个查询词，或用 --path/--count 等统计）。\n' >&2
+  exit 2
+fi
+
+# ---- 解析参数：拦截路径类开关做转换；--regex 做兼容翻译；其余原样透传 ----
+args=()
+query_idx=-1     # args 中 query（位置参数）的下标
+regex_flag=0
+while (($# > 0)); do
+  case "$1" in
+    -h|--help)
+      usage; exit 0 ;;
+    --path|--parent|--es)
+      (($# >= 2)) || die 2 "选项 $1 需要一个值"
+      [[ -n "$2" ]] || die 2 "$1 不能为空：es 对空 -path 静默返回 0 条，会被误判成“没有文件”"
+      args+=("$1" "$(to_win "$2")"); shift 2 ;;
+    --path=*|--parent=*|--es=*)
+      opt="${1%%=*}"; val="${1#*=}"
+      [[ -n "$val" ]] || die 2 "$opt 不能为空：es 对空 -path 静默返回 0 条"
+      args+=("$opt" "$(to_win "$val")"); shift ;;
+    -n|--limit|--offset|--sort|--instance)
+      (($# >= 2)) || die 2 "选项 $1 需要一个值"
+      args+=("$1" "$2"); shift 2 ;;
+    --regex)
+      # es 1.1.0.38 的 -regex 是“带参开关”（-regex <search>），包装器把开关插在
+      # -regex 与 query 之间，导致正则查询恒 0 命中。改用 Everything 的 regex: 前缀。
+      regex_flag=1; shift ;;
+    --)
+      # 保留分隔符，让 -- 之后的词（哪怕以 - 开头）作为 query 传给包装器
+      args+=("--"); shift
+      while (($# > 0)); do
+        [[ "$query_idx" -lt 0 ]] && query_idx=${#args[@]}
+        args+=("$1"); shift
+      done ;;
+    -*)
+      args+=("$1"); shift ;;
+    *)
+      [[ "$query_idx" -lt 0 ]] && query_idx=${#args[@]}
+      args+=("$1"); shift ;;
+  esac
+done
+
+# --regex 兼容：把 query -> "regex:<query>"，不把 --regex 交给包装器
+if ((regex_flag)); then
+  if ((query_idx >= 0)); then
+    q="${args[$query_idx]}"
+    if [[ "$q" != regex:* ]]; then
+      args[$query_idx]="regex:$q"
+    fi
+  else
+    printf 'hfind: 注意：给了 --regex 但没有 query，已按“无查询条件”处理。\n' >&2
+  fi
+fi
+
+# ---- 依赖检查：读 Windows 侧资产用 Linux 视图，传给 Windows 用 Windows 视图 ----
+WINPY_LINUX="$(to_linux "$WINPY_LINUX")"
+SEARCH_LINUX="$(to_linux "$SEARCH_LINUX")"
+[[ -x "$WINPY_LINUX" ]] || die 127 "找不到可执行的 Windows Python：$WINPY_LINUX（可用 HTOOLS_WINPY 覆盖）"
+[[ -f "$SEARCH_LINUX" ]] || die 127 "找不到 Everything 包装脚本：$SEARCH_LINUX（可用 HTOOLS_EVERYTHING_SEARCH 覆盖）"
+SEARCH_WIN="$(to_win "$SEARCH_LINUX")"
+
+# 从 Windows 盘上的目录启动，避免 WSL 把 UNC cwd 传给 Windows 程序。
+cd /mnt/c/Windows/Temp 2>/dev/null || cd /mnt/c 2>/dev/null || true
+
+# 保证 Windows Python 的 stdout/stderr/stdin 一律 UTF-8（中文路径不乱码、错误可读）。
+# 用 -X utf8 而不是 PYTHONIOENCODING：WSL 环境变量默认不会传给 Windows 进程（实测），
+# 而 -X utf8 是进程级开关，必定生效。
+# Windows Python 的文本模式会把 \n 写成 \r\n；过滤掉 CR，保证 stdout/stderr 在 WSL 里
+# 可直接 grep/awk/JSON 解析（Windows 路径本身不含 CR，安全）。
+"$WINPY_LINUX" -X utf8 "$SEARCH_WIN" "${args[@]}" \
+  2> >(tr -d '\r' >&2) | tr -d '\r'
+rc=${PIPESTATUS[0]}
+wait 2>/dev/null || true
+exit "$rc"
