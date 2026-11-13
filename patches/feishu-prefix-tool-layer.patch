@@ -1,0 +1,198 @@
+diff --git a/docs/007-architecture.md b/docs/007-architecture.md
+index 184ea54..ab69d99 100644
+--- a/docs/007-architecture.md
++++ b/docs/007-architecture.md
+@@ -276,7 +276,7 @@ Each model request binds the Session to the current prompt revision. The revisio
+ 
+ Some generic modules still refer directly to GitHub or Feishu:
+ 
+-- Outbox applies the Feishu chat word limit.
++- Outbox applies the Feishu chat word limit; the Feishu Channel adds each message's speaker prefix at delivery, and the limit covers only the message text.
+ - `src/app/links.ts` resolves Feishu message links and `repliedTo`. It and Runtime read settings with `feishuSettings`.
+ - `src/app/resources.ts` reads the `feishu/` and `github/` originals; `src/app/cards.ts` uses `pullOf` for Ticket cards.
+ - Runtime sends `pullEndNotices` for merged or closed Tickets.
+@@ -410,6 +410,7 @@ Some generic modules still refer directly to GitHub or Feishu:
+ | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
+ | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
+ | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
++| `tests/feishu-channel.spec.ts` | The Feishu Channel's delivery: the speaker prefix it renders, and what the IM word limit counts |
+ | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
+ | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
+ | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
+diff --git a/src/core/ports.ts b/src/core/ports.ts
+index 08c7a1c..3d5ad13 100644
+--- a/src/core/ports.ts
++++ b/src/core/ports.ts
+@@ -68,8 +68,13 @@ export interface Executor {
+   stop(ticket: Ticket, assignment: Assignment, reason: string): void
+ }
+ 
+-/** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. */
+-export interface OutboundMessage { id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string }
++/**
++ * A message for a Channel; `ticketId` names the Ticket it is for, when there is one, and `speaker` names who speaks for it,
++ * which a Channel that shows a speaker, such as Feishu, renders and others ignore.
++ */
++export interface OutboundMessage {
++  id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string; speaker?: string
++}
+ /** A queued message waits (`pending`), went out (`sent`), or was dropped because its conversation can never receive it (`dropped`). */
+ export type ReplyStatus = 'pending' | 'sent' | 'dropped'
+ /** The messages queued for Channels; the Engine queues them inside its commands, and a sender delivers them later. */
+diff --git a/src/core/replies.ts b/src/core/replies.ts
+index ee5790a..cfa6e04 100644
+--- a/src/core/replies.ts
++++ b/src/core/replies.ts
+@@ -16,6 +16,16 @@ export type ReplyRequest =
+   | { purpose: 'answer' | 'result' | 'attention'; ticketId?: string; triggerId?: string; question?: string; text: string }
+ /** A queued message: its id, whether it went out, and whether an earlier request had queued it already. */
+ export interface Reply { id: string; status: ReplyStatus; reused: boolean }
++/** The main Session's speaker name, for a message no Ticket owns. */
++export const ORCHESTRATOR = 'Orchestrator'
++/** The ticket-id suffix that keeps a ticket's directory name unique; a Channel shows the short name without it. */
++const TICKET_ID_SUFFIX = /-[0-9a-f]{12}$/
++/**
++ * Who speaks for a message: a Ticket's worker under that ticket's short name, or the main Session (`ORCHESTRATOR`) when no
++ * Ticket owns the message. A Channel that shows a speaker, such as Feishu, renders it, so no agent has to write it.
++ */
++export const speakerOf = (ticket: Pick<Ticket, 'execution'> | undefined): string =>
++  ticket?.execution?.name.replace(TICKET_ID_SUFFIX, '') || ORCHESTRATOR
+ 
+ /**
+  * Replies writes the Engine's messages to Channels through the Outbox port: an acknowledgement, the answer to a person's
+@@ -41,7 +51,10 @@ export class Replies extends EnginePart {
+    * and a person wrote it.
+    */
+   acknowledgeAccepted(ticketId: string, trigger: Trigger, text: string): void {
+-    if (trigger.channel && trigger.human) this.options.outbox.send({ id: key('ack', trigger.id), channel: trigger.channel, text, kind: 'acknowledgement', ticketId })
++    if (trigger.channel && trigger.human) {
++      this.options.outbox.send({ id: key('ack', trigger.id), channel: trigger.channel, text, kind: 'acknowledgement', ticketId,
++        speaker: speakerOf(this.repo.tickets.get(ticketId)) })
++    }
+   }
+   /** Withdraw a ticket's question for a person from the outbox, unless it went out already. */
+   withdrawAttention(attentionId: string): void { this.options.outbox.withdraw(key('attention-reply', attentionId)) }
+@@ -57,7 +70,8 @@ export class Replies extends EnginePart {
+     const existing = this.options.outbox.status(id)
+     if (!existing && !trigger.human) throw new UserError('ackNotPerson')
+     // Preserve the automatic or first queued acknowledgement.
+-    if (!existing) this.options.outbox.send({ id, channel: trigger.channel, text: request.text, kind: 'acknowledgement', ticketId: ticket.id })
++    if (!existing) this.options.outbox.send({ id, channel: trigger.channel, text: request.text, kind: 'acknowledgement', ticketId: ticket.id,
++      speaker: speakerOf(ticket) })
+     this.takeUp(ticket.id, trigger.id)
+     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
+   }
+@@ -83,7 +97,7 @@ export class Replies extends EnginePart {
+     const asker = attention?.triggerId ? this.repo.triggers.get(attention.triggerId) : undefined
+     const channel = request.purpose === 'answer' ? trigger!.channel : asker?.channel ?? (ticket ? this.sourceChannel(ticket) : undefined)
+     if (!channel) throw new UserError('noChannel')
+-    this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {} })
++    this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {}, speaker: speakerOf(ticket) })
+     if (request.purpose === 'answer' && ticket && trigger && ticket.answers?.includes(trigger.id)) {
+       ticket.answers = ticket.answers.filter(item => item !== trigger.id)
+       this.repo.tickets.save(ticket)
+diff --git a/src/sources/feishu-channel.ts b/src/sources/feishu-channel.ts
+index db2d33d..d81ab18 100644
+--- a/src/sources/feishu-channel.ts
++++ b/src/sources/feishu-channel.ts
+@@ -19,8 +19,12 @@ const gone = (error: unknown): boolean => error instanceof CliError && error.cod
+ export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
+   const messageId = message.channel.address.messageId
+   if (!messageId) throw new Error('Missing Feishu reply target')
++  // The speaker is delivery-layer decoration: the model writes only the message, the limit counts only the message, and the
++  // receipt keeps only the message. A text that already carries the same prefix is sent as it is, so the prefix never doubles.
+   const text = checkedImText(message.text)
+-  const reply = ['im', '+messages-reply', '--message-id', messageId, '--markdown', text, '--reply-in-thread', '--idempotency-key', message.id]
++  const prefix = message.speaker ? `[${message.speaker}] ` : ''
++  const shown = prefix && !text.startsWith(prefix) ? prefix + text : text
++  const reply = ['im', '+messages-reply', '--message-id', messageId, '--markdown', shown, '--reply-in-thread', '--idempotency-key', message.id]
+   try { await host.commands.lark(reply) }
+   catch (error) {
+     if (gone(error)) return 'gone'
+diff --git a/tests/core-engine.spec.ts b/tests/core-engine.spec.ts
+index 733d134..b3e8b94 100644
+--- a/tests/core-engine.spec.ts
++++ b/tests/core-engine.spec.ts
+@@ -121,7 +121,7 @@ describe('eval', () => {
+     expect(ticket).not.toHaveProperty('ended')
+     expect(ticket.assignments).toEqual([expect.objectContaining({ state: 'running', startedAt: expect.any(String) })])
+     expect(h.repo.threads.get('chat:t1')?.subscriptions).toEqual([ticket.id])
+-    expect(h.outbox).toEqual([{ id: key('ack', '1'), channel: trigger('1').channel, text: 'ok', kind: 'acknowledgement', ticketId: ticket.id }])
++    expect(h.outbox).toEqual([{ id: key('ack', '1'), channel: trigger('1').channel, text: 'ok', kind: 'acknowledgement', ticketId: ticket.id, speaker: 'Orchestrator' }])
+     expect(h.executor.start).toHaveBeenCalledOnce()
+   })
+   it('refuses to decide an eval that a later eval replaced, and decides the later one', async () => {
+@@ -1008,6 +1008,19 @@ describe('automatic input', () => {
+   })
+ })
+ describe('replies', () => {
++  it('labels a message with who speaks for it: a ticket\'s short name, or the main Session', () => {
++    const h = harness({}, { prepareTicket: ticket => ({ ...ticket, execution: { name: 'fix-plan-color-0123456789ab', directory: '/tmp/fix-plan-color', assignment: '' } }) })
++    const ticketId = accepted(h).ticketId!
++    // A ticket's acknowledgement speaks as its worker, under the short name without the directory-unique id suffix.
++    expect(h.outbox.at(-1)).toMatchObject({ kind: 'acknowledgement', ticketId, speaker: 'fix-plan-color' })
++    h.engine.report(ticketId, { state: 'ready', summary: 'PR ready' })
++    h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })
++    expect(h.outbox.at(-1)).toMatchObject({ kind: 'reply', ticketId, speaker: 'fix-plan-color' })
++    // A message no ticket owns speaks as the main Session.
++    h.engine.receive(trigger('6', { actor: guest, threads: [{ source: 'chat', id: 'elsewhere' }] }))
++    h.engine.reply({ purpose: 'answer', triggerId: '6', text: 'Yes' })
++    expect(h.outbox.at(-1)).toMatchObject({ kind: 'reply', speaker: 'Orchestrator' })
++  })
+   it('acknowledges a person\'s message that reached an open ticket once, and refuses others', () => {
+     const h = harness()
+     const ticketId = accepted(h).ticketId!
+diff --git a/tests/feishu-channel.spec.ts b/tests/feishu-channel.spec.ts
+new file mode 100644
+index 0000000..e80162e
+--- /dev/null
++++ b/tests/feishu-channel.spec.ts
+@@ -0,0 +1,35 @@
++/** The Feishu Channel renders the speaker a message carries at delivery: once, never doubled, never counting toward the IM limit. */
++import { expect, it, vi } from 'vitest'
++import type { OutboundMessage } from '../src/core/index.ts'
++import { Commands } from '../src/infra/commands.ts'
++import { sendFeishu } from '../src/sources/feishu-channel.ts'
++import { feishuChannel } from '../src/sources/feishu-trigger.ts'
++import { testDeployment } from './fixtures/deployment.ts'
++
++const channel = feishuChannel('oc_team', 'om_1')
++/** Sends one message through the Feishu Channel and returns the Markdown the bot CLI was given plus every argument. */
++async function send(text: string, speaker?: string) {
++  const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
++  const run = vi.spyOn(commands, 'run').mockResolvedValue('{"ok":true,"data":{}}')
++  const message: OutboundMessage = { id: 'reply-1', channel, text, kind: 'reply', ...speaker ? { speaker } : {} }
++  await sendFeishu({ commands }, message)
++  const args = run.mock.calls[0]![1]
++  return { args, markdown: args[args.indexOf('--markdown') + 1]! }
++}
++
++it('prefixes a message with its speaker at delivery', async () => {
++  expect((await send('Done', 'fix-plan-color')).markdown).toBe('[fix-plan-color] Done')
++})
++
++it('leaves a message without a speaker unprefixed', async () => {
++  expect((await send('Done')).markdown).toBe('Done')
++})
++
++it('does not double a prefix the message already carries', async () => {
++  expect((await send('[fix-plan-color] Done', 'fix-plan-color')).markdown).toBe('[fix-plan-color] Done')
++})
++
++it('counts only the message toward the IM word limit, not the prefix', async () => {
++  const text = Array.from({ length: 100 }, (_, index) => `word${index}`).join(' ')
++  expect((await send(text, 'a-very-long-ticket-name')).markdown).toBe(`[a-very-long-ticket-name] ${text}`)
++})
+diff --git a/tests/runtime.spec.ts b/tests/runtime.spec.ts
+index fd737f2..d0bed3e 100644
+--- a/tests/runtime.spec.ts
++++ b/tests/runtime.spec.ts
+@@ -231,7 +231,7 @@ it('relays an explicit member mention as a candidate and creates the ticket, ack
+   expect(runtime.store.threads.get(`feishu:${CHAT}:om_1`)?.subscriptions).toEqual([ticket.id])
+   expect(runtime.store.replyStatus(key('ack', trigger.id))).toBe('sent')
+   const larkCalls = vi.mocked(Commands.prototype.lark).mock.calls.map(([args]) => args)
+-  expect(larkCalls.find(args => args[1] === '+messages-reply')).toEqual(expect.arrayContaining(['--message-id', 'om_1', '--markdown', '收到，修复回归。']))
++  expect(larkCalls.find(args => args[1] === '+messages-reply')).toEqual(expect.arrayContaining(['--message-id', 'om_1', '--markdown', `[${worktreeName}] 收到，修复回归。`]))
+   // The first message holds the request itself: an explicit ticket has no assignment text beyond it, and nothing to read first.
+   const first = relays(sessionId)[0]!
+   expect(first).toEqual({ ticket_id: ticket.id, title: '修复回归', trigger: expect.objectContaining({ trigger_id: trigger.id, from: MEMBER,
