@@ -113,7 +113,7 @@ hmail --subject <标题> [--body <正文> | --body-file <文件>]
 
 ## 5. 邮件转发交付规则（团队提示词）
 
-在团队提示词 `delivery` 段追加（当前部署 revision 4；config 为纯追加，`communication`/`scope` 未动）：
+在团队提示词 `delivery` 段追加（当前部署 revision 5；config 为纯追加，`communication`/`scope` 未动）：
 
 > 需要告诉用户的内容一律走邮件（用户明确要求：邮箱看全文，IM 只作提示）。Executor 在报告 ready，或用 human_action 提出需要人决策的问题、说明阻塞时，必须用 `/root/work/state/tools/hermes-port/hmail` 把面向用户的内容发到用户邮箱：短结果用 `--subject/--body`；长文（报告、文档、markdown、PR 说明）用 `--body-file <文件>` 发送全文，hmail 默认经 Hermes 排版成 HTML（含纯文本兜底），邮件里保留交付物/PR 链接与必要的下一步。收件人由 hmail 固定，不要指定收件人。同一内容只发一封，不要重复；主 Session 在 IM 只保留一句指针和链接，不再发同类邮件；普通进度、未完成草稿和内部排查不发邮件。Executor 的 bash 前台命令 5 秒后会转入后台任务：若 hmail 转入后台，等它的 job 结束并确认退出码 0，不要重复发送。
 
@@ -160,7 +160,7 @@ curl -s -X PUT -H "$H" -H 'content-type: application/json' \
 curl -s -H "$H" "$BASE/prompts?revision=2"
 ```
 
-本工单的两次保存：revision 3（新增 `hermes-tools` 技能 + 主 Session 邮件转发规则）、revision 4（改为 Executor 发信 + 邮件优先内容交付）。回滚到任一旧 revision 即可，历史版本永久保留。
+本工单的三次保存：revision 3（新增 `hermes-tools` 技能 + 首版邮件转发规则）、revision 4（按用户要求改为 Executor 发信 + 邮件优先内容交付）、revision 5（修正技能文本笔误）。回滚到任一旧 revision 即可，历史版本永久保留。
 
 ## 7. 验证记录
 
