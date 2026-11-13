@@ -1,14 +1,15 @@
-# SuperAgent 引入 DSH 常驻队友：现状验证、设计意图与分阶段计划
+# SuperAgent 引入 DSH 常驻队友：现状验证、设计取舍与分阶段计划
 
-> 状态：待方向确认。本文记录 2026-11-13 的实机验证结果与实施计划，供评审后再进入 executor 层改动。
-> 结论先行：能力已经跑通，但当前是「工单内常驻」；「跨工单常驻」需要把 team root（团队根会话）从 worker 会话移到长期存在的会话，属 executor 层改动。
+> 状态：待方向确认（2026-11-13）。
+> 结论先行：能力已经跑通，缺的不是版本而是开关；「常驻」应落在**工单粒度**上——用「项目级工单」承载持续工作，而不是另做一套跨工单团队去绕开 SuperAgent 的架构。
 
 ## 0. 结论摘要
 
 - **不是 DSH 版本落后，缺的是开关**：本机部署的 DSH 0.2.1-rc.3 已内置实验性 Agent Teams bundle（`@deepseek-ai/dsh-experimental-agent-team-profile`），默认关闭；在 profile 的 `dsh.profile.bundles` 中启用后，SuperAgent 的 worker Session 立即获得 `spawn_teammate` / `send_message` / `wait_agent` / `team_task_*` 等团队工具，不需要升级 DSH。
-- **已实测可用**：worker 会话内成功创建一个 fork 分身与一个 fresh 队员，均收到回报。当前形态是「工单内常驻」：team root 就是 worker 会话自身，工单结束即释放。
-- **跨工单常驻的核心约束**：`SessionCreateRequest` 没有 `parentSession` 字段（`@deepseek-ai/dsh-api-session-controller/lib/types/types.d.ts`），所以不能用现有 `sessionController.create` 把 worker 挂到主 Session 名下；要挂必须改走 Team/subagent 的创建路径。这是本计划的关键判断。
-- **建议**：先用「工单内 teammate（默认 fork、评审 fresh）」承接并行调研与评审；跨工单常驻按 P2 单独设计，先拍板 team root 形态与免工单边界。
+- **已实机验证**：worker 会话内成功创建 fork 分身与 fresh 队员各一个，`list_agents` 可见、`send_message` 往返正常。当前是「工单内常驻」：team root 就是 worker 会话自身，工单结束即释放。
+- **主 Session 也有 Team 工具（实证）**：orchestrator 的 model 请求头里已出现 `spawn_teammate` / `list_agents` / `send_message` / `team_task_*` 等工具；但它的系统提示是 `complete: true`，会丢弃 Team 策略段，等于「能自行开团却没有策略约束」——这是需要加守卫/提示词的现实风险。
+- **设计取舍：按工单粒度承载持续项目，而不是跨工单团队**。一个持续项目放进一个工单：worker Session 在工单存续期内可反复唤醒、多轮 handoff、里程碑推进；工单完成后才释放。这样保留授权、外部锚（thread/PR/CI）与完成判定，也避免绕开 SuperAgent 的架构。跨工单常驻只作为未来可选项（P3），默认不做。
+- **建议**：P1 把「工单内 teammate（默认 fork、评审 fresh）」用起来并补提示词与守卫；P2 定义「项目级工单」的边界与生命周期规则（提示词/策略层，必要时小改 executor 对 teammate 的处置）；暂不动 Session 创建路径。
 
 ## 1. 现状验证（2026-11-13）
 
@@ -16,100 +17,93 @@
 
 | 项 | 事实 | 证据 |
 | --- | --- | --- |
-| DSH CLI | 0.2.1-rc.3（已安装，`dsh --version`） | `/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json` |
-| Agent Teams 包 | 随安装分发，实验性 optional bundle；三个包 `dsh-experimental-agent-team`、`-tool-agent-team`、`-profile` 版本同为 0.2.1-rc.3 | 同目录 `node_modules/@deepseek-ai/dsh-experimental-agent-team-profile/cordis.patch.yml` |
+| DSH CLI | 0.2.1-rc.3（已安装，`dsh -V`） | `/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json` |
+| Agent Teams 包 | 随安装分发，实验性 optional bundle；`dsh-experimental-agent-team`、`-tool-agent-team`、`-profile` 同为 0.2.1-rc.3 | CLI 的 `node_modules/@deepseek-ai/dsh-experimental-agent-team-profile/cordis.patch.yml` |
 | 默认状态 | 关闭：shipped profile 模板不含该 bundle，插件管理器把它列为可开启项 | `@deepseek-ai/dsh-app-boot/lib/index.js` 的 `OPTIONAL_BUNDLES` |
 | 本机启用 | profile bundles 已追加该 bundle | `/root/.dsh/profiles/superagent/package.json` |
-| npm 最新 | 0.2.2-rc.1 / next 0.2.2-rc.3，仍是同一批实验包；升级不是启用前提 | `npm view @deepseek-ai/dsh version dist-tags` |
-| teammate 提供者 | fresh=`spawn`，fork=`fork`，两个 provider 均由 dsh-base 注册 | profile dump：`subagent-spawn-in-process` / `subagent-fork-in-process` |
-
-启用方式：在 Web 面板的插件/视图里打开「智能体团队」，或等价地在该 profile 的 `dsh.profile.bundles` 中加入 `@deepseek-ai/dsh-experimental-agent-team-profile`；重载后生效，无需重装或升级。
+| 启用方式 | 面板开关；或 `dsh plugin --profile <name> add @deepseek-ai/dsh-experimental-agent-team-profile`（透传 pnpm） | `dsh plugin --help` |
+| npm 版本 | `@deepseek-ai/dsh` latest=0.2.2-rc.1、next=0.2.2-rc.3；team 包 0.2.2-rc.1 描述与 0.2.1-rc.3 相同，无新能力证据；注意 team 包 latest tag 停在旧的 0.1.5-alpha.2，勿按 latest 裸装 | `npm view` |
+| teammate 提供者 | fresh=`spawn`、fork=`fork`，两个 provider 均由 dsh-base 注册 | profile dump：`subagent-spawn-in-process` / `subagent-fork-in-process` |
 
 ### 1.2 为什么 worker 会话能拿到 Team 工具
 
 1. `tool-agent-team` 只在「Team 成员」的 Agent scope 安装工具（`dsh-experimental-tool-agent-team/lib/index.js` 的 `apply`/`install`）。
 2. DSH 的 Team 是隐式的：顶层 Session（没有 `parentSession`，或父会话不是成员）自己就是 team root，`tryMembership` 返回 `role: 'lead'`（`dsh-experimental-agent-team/lib/index.js` 的 `tryMembership`）。SuperAgent 的 worker Session 由 `sessionController.create` 创建，是顶层 Session，因此自动成为 lead。
-3. Team 工具注册在 Agent 自身 scope；SuperAgent 的 `tools.restrict` 只遮蔽继承工具（`src/app/sessions.ts` 的 `workOnly` 通过父 scope 取可用工具名），所以这些本地工具不被 `WORK_TOOLS` 名单遮蔽。
-4. 主 Session 同样是顶层 Session（`src/app/sessions.ts` 创建 `orchestrator-*` 会话），按同一逻辑也应是 lead 并持有 Team 工具——这一点是代码推断，尚未在主 Session 上实测。
+3. Team 工具注册在 Agent 自身 scope；SuperAgent 的 `tools.restrict` 只过滤继承工具，不遮蔽本层注册（`src/app/sessions.ts` 的 `workOnly` 按父 scope 取可用名单）。所以 `WORK_TOOLS` 不参与 Team 工具的可见性，无需修改。
+4. 主 Session 同属顶层 Session，按同一逻辑也拿到 Team 工具——已用其 model 请求头的工具表实证。
 
 ### 1.3 实机验证记录
 
 - 工单 worker 会话内 `list_agents` 可见自身为 lead。
-- `spawn_teammate` 创建 fork 分身（继承 lead 已完成轮次）成功；该分身确认自己能看到 lead 已完成上下文，且当前未完成轮次不在继承范围内。
-- `spawn_teammate` 创建 fresh 队员（独立上下文）成功，二者均通过 `send_message` 向 lead 回报。
-- 两个成员都出现在 `list_agents` 中；成员完成后转为 `inactive`，可被 `send_message` 再次唤醒（可续会话语义）。
+- `spawn_teammate` 创建 fork 分身（继承 lead 已完成轮次）成功；分身确认能看到 lead 已完成上下文，当前未完成轮次不在继承范围内。
+- `spawn_teammate` 创建 fresh 队员（独立上下文）成功；两者均通过 `send_message` 向 lead 回报，成员完成后转 `inactive`。
+- 主 Session 请求头工具表含 Team 工具（实证）；但其 system prompt 中 `TEAM_POLICY` 段被 `complete: true` 抑制（`src/app/sessions.ts` 的 prompt section 注册 + `dsh-system-prompt` 的 complete 语义）。
 
-### 1.4 当前能力边界
+### 1.4 生命周期与边界
 
-| 能做 | 不能做 |
+| 能做 | 不能做 / 风险 |
 | --- | --- |
-| 工单内创建 fork/fresh 常驻队友，多次唤醒、互相发消息、共享任务板 | 队友跨工单存活：team root 是当前 worker 会话，工单结束即释放，工具随之收回（`src/app/sessions.ts` 的 ticket 结束守卫） |
-| 队友与 lead 共享同一文件系统与工作目录，可并行读、按写域分工写 | 队友之间写同一文件没有锁，只有 advisory 的 `write_scopes` 提示 |
-| fork 继承 lead 已完成轮次的上下文；fresh 只带初始任务 | fork 不包含「尚未完成」的当前轮内容，spawn 初始任务必须自包含 |
-| 成员完成后转为 inactive，可被 `send_message` 再次唤醒（可续会话语义） | 队员生命周期随 team root；team root 所在的 worker 会话结束后，成员无法再被唤醒 |
+| 工单内创建 fork/fresh 队友，多次唤醒、互相发消息、共享任务板 | 队友不跨工单：team root 是 `worker-<ticketId>`，工单结束即释放，工具随之收回 |
+| 队友与 lead 共享文件系统，按 `write_scopes` 分工写（advisory，无锁） | 多个成员写同一文件会互相覆盖；也没有 git worktree 级隔离 |
+| fork 继承 lead 已完成轮次；fresh 只带初始任务 | fork 不包含未完成的当前轮，spawn 初始任务必须自包含 |
+| 成员可冷唤醒（continuable 语义） | handoff / Assignment 结束时 executor 会 `stopSubagents` 让队友休眠；工单内后续可 `send_message` 冷唤醒，但需要 lead 主动发消息，且工单结束后无法再唤醒 |
+| 主 Session 已持有 Team 工具 | 主 Session 的 Team 策略段被抑制，Router 可能自行开团却无约束 → 需要 guard 或提示词禁用 |
 
-## 2. 设计意图：为什么值得跨工单常驻
+## 2. 设计取舍：项目级工单，而不是跨工单团队
 
-- **上下文成本**：现在每个工单一个独立 worker Session，同一项目要反复重读仓库、重复解释背景；跨工单经验只落在文件/PR 里，模型层面没有「同一个队友」的连续性。让一队常驻分身带着项目记忆长期存在，可降低重复读取与重复解释成本。
-- **角色连续性**：人设、职责与项目知识可以挂在一个长期成员上（如架构看护、评审官、某子项目的长期负责人），而不是每个工单重新塑造。
-- **与工单互补而非替代**：工单的价值在「按目标切分上下文 + 外部锚（thread/PR/CI）+ 完成判据 + 显式转交」；常驻队友补的是「跨目标连续、低延迟协作、fork 继承背景」。长任务与对外交付仍应走工单，短活/调研/评审可免工单。
+- **工单可长可短**：工单不是一次性会话，而是「按目标切分的持久执行单元」——worker Session 按 `worker-<ticketId>` 常驻，可在工单存续期内被后续消息反复唤醒、多轮 handoff、推进里程碑；目标完成（ready）或放弃（dropped）才释放。
+- **持续项目 = 一个项目级工单**：如果预期一个项目会持续数天/数周、多轮推进，就把它放在一个工单里；里程碑用 progress 报告推进，交付时再 ready。上下文仍按工单隔离，文件与 PR 作为跨轮记忆的真源。
+- **为什么不做跨工单常驻**：
+  1. 会绕开 SuperAgent 的授权、外部锚（thread/PR/CI）、完成判定与报告回传链路；
+  2. 技术上要把 worker 挂到长期 team root 下，而 `SessionCreateRequest` 没有 `parentSession` 字段，必须改走 Team/subagent 创建路径，并豁免 `stopSubagents` 对 Team child 的停止——是实质性的架构改动；
+  3. 收益可以用「项目级工单」低成本获得：同一工单内上下文、目录、队友、文件都连续。
+- **跨工单常驻只作为未来可选项（P3）**：仅用于「跨项目共享角色」（如长期评审官、架构看护）且无法用文件/PR 承载时，再单独立项。
 
 ## 3. 三种工作形态对比
 
-| 维度 | 工单（ticket） | 免工单转交（Team teammate） | 常驻团队（目标形态） |
+| 维度 | 临时工单 | 项目级工单（推荐承载持续工作） | 免工单转交（Team teammate） |
 | --- | --- | --- | --- |
-| 上下文 | 每工单独立、按目标切分；转交需显式给背景 | fork 继承主线已完成轮次；fresh 只带任务 | 主线会话常驻，成员带项目记忆；文件为真源 |
-| 生命周期 | 目标完成即结束释放 | 随 lead 会话存活；成员可休眠/唤醒 | 跨工单长期存活，按角色持续存在 |
-| 外部锚 | 有（thread/PR/CI/完成判定） | 无 | 工单仍是外部锚，成员是其执行者 |
-| 授权 | 明确（Policy/accept） | 仅「对话中被要求」 | 需新设计：谁能派活、谁能对外发言 |
-| 成本 | 会话引导 + 上下文转交 | 低延迟；fork 复制上下文有 token 成本 | 常驻上下文与压缩策略需调优 |
-| 风险 | 跨单不记忆、重复读 | 无锚、失败无人接手、fork 继承偏差 | 注意力预算、成员上限、崩溃恢复 |
+| 适用 | 一次性小改、单点修复 | 持续项目、多轮推进、需要外部锚 | 对话内调研/评审/并行推演 |
+| 生命周期 | 完成即释放 | 项目存续期内常驻，里程碑推进，交付后释放 | 随 lead 会话存活，成员可休眠/唤醒 |
+| 上下文 | 每单独立、显式转交 | 同单连续，文件/PR 为真源 | fork 继承主线已完成轮次 |
+| 外部锚/授权 | 有 | 有（里程碑 + 最终交付锚） | 无（只在对话中被要求） |
+| 队友 | 工单内可用 | 工单内常驻（handoff 后休眠、可冷唤醒） | lead 的会话分身 |
 
 ## 4. 分阶段计划
 
 ### P0（已完成）：启用与实机验证
 
 - 启用 `@deepseek-ai/dsh-experimental-agent-team-profile`。
-- 验证 worker 会话内的 fork/fresh 队友创建、消息往返、成员可见性。
-- 验证记录见 §1.3。
+- 验证 worker 会话内 fork/fresh 队友创建、消息往返、成员可见性。
+- 记录边界：工单内常驻、handoff 会休眠、工单结束即释放。
 
 ### P1（低成本，不需要改 executor）：把工单内队友用起来
 
-- 提示词：在 worker 的团队提示词里说明「需要并行调研/独立评审时可创建 teammate；默认 fork，评审用 fresh；spawn 任务必须自包含（fork 不含当前未完成轮次）」。
-- 边界：写域划分、成员上限（默认每队 8）、共享任务板用法（`team_task_*` + `write_scopes` + `blocked_by`）。
-- 守卫：worker 的 ticket 结束守卫保持不变；队友随工单释放。
-- 验证：用一次真实工单做「fork 分身并行调研 + fresh 评审」的对照实验，记录 token 与耗时。
+- 提示词：worker 的团队提示词说明「何时创建 teammate、默认 fork、评审用 fresh、spawn 任务必须自包含、handoff 后成员会休眠」。
+- 守卫：主 Session 的 Team 工具加 `tools.guard` 拒绝，或在其提示词里显式禁止开团；worker 侧保留现状。
+- 协作规范：写域划分、成员上限（默认每队 8）、共享任务板（`team_task_*` + `write_scopes` + `blocked_by`）。
+- 决策：经典 `subagent` 与 Team 并存还是收敛到一种。
 
-### P2（executor 层）：让 worker 成为长期 team root 的成员
+### P2（策略/文档层）：定义「项目级工单」
 
-两条路线二选一：
+- 定义什么算工单：持续项目一个工单；只有出现「新的外部目标/新的完成锚」才拆新工单。
+- 生命周期规则：长工单如何报告进度、何时视为完成、何时该拆单；blocked/failed 后的恢复约定。
+- 队友在长工单内的处置：handoff 后队友休眠，下一轮由 lead 冷唤醒（先验证可达性）；若需要跨 handoff 持续存活，再评估对 `stopSubagents` 做豁免的小改动。
+- 文档：更新 `docs/003-execution.md`（长工单与队友生命周期）、`docs/004-prompts.md`、`docs/006-deployment.md`、README/SETUP；如动 preset 需同步 `tests/bundle-patch.spec.ts`。
 
-- **路线 A：主 Session 作为 team root**。executor 不再用 `sessionController.create` 直接建 worker，而用 Team/subagent 的创建路径（`agentTeams.spawnTeammate` 或等价 continuable subagent provider）创建 worker 成员，`parentSession`=主 Session。工单结束只停止该成员本轮工作、不销毁成员；下一次工单可复用或唤醒。
-- **路线 B：专用常驻队长会话**。新增一个长期存在的「团队队长」Session 作为 team root，主 Session 保持瘦路由器职责；executor 把工单派给队长的 worker 成员。好处是路由与团队编排解耦，风险是再多一个常驻 Session 要管理。
+### P3（可选，默认不做）：跨工单常驻
 
-两条路线都必须处理：
-
-1. worker 会话 ID 约定（`worker-<ticketId>`）与成员身份的映射、重启后的恢复；
-2. assignment/input 投递与报告回传仍走现有 Executor/Engine 链路；
-3. 并发 worker slot 与 Team 成员上限的关系；
-4. 权限/预设继承（worker preset、subagent 的 `standard` preset 与 Team 成员身份）；
-5. ticket 结束后「工具收回」策略改为「停止本轮、保留成员但拒绝无工单授权的新工作」；
-6. 崩溃/重启恢复：主 Session 或队长会话重启后，成员与工单的对应关系恢复。
-
-### P3（产品形态）：常驻队长 + 工单退化为任务项
-
-- 主/队长会话对人的对话入口保持单一（注意力预算），队友之间通过 `send_message` 协作。
-- 人设与项目记忆：人设放团队提示词/成员描述；项目记忆以文件为真源，session 只做短期上下文（压缩会丢中间细节）。
-- 面板展示 roster 与共享任务板；需要独立评审时强制 fresh。
+- 仅在跨项目共享角色确有需要时启用；需要把 team root 迁到长期 Session（主 Session 或专用常驻队长会话），并改 Team child 的停止/恢复策略。
 
 ## 5. 待拍板决策
 
-1. **team root 形态**：主 Session（路线 A）还是专用常驻队长会话（路线 B）？
-2. **免工单范围**：建议只读调研/评审免单；写仓库、对外交付必须走工单（保留授权与完成锚）。
-3. **默认上下文**：是否默认 fork、fresh 仅用于评审？fork 的成本与假设继承偏差需要接受。
-4. **成员上限与并发**：每队默认 8 个成员；常驻成员数量与 worker slot 如何配比？
+1. **工单粒度**：是否采用「项目级工单」（持续项目一个工单、里程碑推进、交付后释放）？拆单/完成判据怎么写？
+2. **主 Session 的 Team 权限**：禁用（guard/提示词）还是保留但补策略段？
+3. **上下文默认**：默认 fork、评审用 fresh？fork 的成本与假设继承偏差是否接受？
+4. **工具收敛**：经典 `subagent` 与 Team 并存，还是只保留一种？
+5. **并发与隔离**：每队默认 8 个成员、无 worktree 隔离是否接受？
 
 ## 6. 验证方法与限制
 
-- 验证方式：静态核对相关代码/配置（行号见表与正文），加实机创建 teammate 与消息往返。
-- 限制：只在 DSH 0.2.1-rc.3 + 实验性 Agent Teams 上验证；未做进程重启后的成员恢复测试；未量化 fork 的 token 成本；主 Session 持有 Team 工具是代码推断，尚未实测；跨工单常驻尚未实现。
+- 验证方式：静态核对相关代码/配置，加实机创建 teammate 与消息往返；主 Session 工具表取自其持久化 model 请求头。
+- 限制：只在 DSH 0.2.1-rc.3 + 实验性 Agent Teams 上验证；未做进程重启后的成员恢复测试；工单内队友跨 handoff 的冷唤醒是代码推断，尚未实测；fork 的 token 成本未量化；项目级工单尚未落成规则。
