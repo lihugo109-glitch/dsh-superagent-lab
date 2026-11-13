@@ -59,6 +59,21 @@
   3. 收益可以用「项目级工单」低成本获得：同一工单内上下文、目录、队友、文件都连续。
 - **跨工单常驻只作为未来可选项（P3）**：仅用于「跨项目共享角色」（如长期评审官、架构看护）且无法用文件/PR 承载时，再单独立项。
 
+### 2.1 两层工作单元，不要混为一谈
+
+| 层 | 是什么 | 管什么 | 不管什么 |
+| --- | --- | --- | --- |
+| 外层：SuperAgent Ticket | 对外的工作单元，建议做成项目级、可长可短 | 授权、外部锚（thread/PR/CI）、报告回传、完成判定 | 团队内部分工的细节 |
+| 内层：Team 共享任务板 | DSH Agent Teams 自带 `team_task_*`，轻量任务 DAG | 团队内分工：owner、`blocked_by`、`write_scopes`、revision | 授权、外部锚、结束工单 |
+
+因此「常驻」不等于「跨工单团队」：外层仍用 Ticket（项目级），内层用现成任务板分工；短活/评审也可以完全免 Ticket，只用 teammate + 任务板（无外部锚，不适合对外交付）。
+
+### 2.2 长工单的可行性核对
+
+- **寿命**：工单没有时间上限，只有人停止、`ready` 且无 PR、或 PR 全部关闭会结束它（`src/core/tickets.ts:86-89,345`）；人的消息可以恢复原工单（`:258`）。硬限制只在每轮：后台工作 30 分钟（`src/executor/dsh.ts:32`）、prepare 只在首轮最多 10 分钟（`:28`）、并发槽只占 launch/turn（`docs/003-execution.md` 的 Concurrency）。
+- **上下文**：工具结果超过 8192 字符只保留头 4096 + 尾 1024（`cordis.patch.yml` 的 tool-result-pruner），长工单会「腐烂」；但工单目录稳定、prepare 只跑一次，worktree/PR/thread 天然是外部真源，**文件为真源 + 阶段性 checkpoint** 是对策。
+- **卡点**：现有规则下「PR 合并/关闭即结束工单」，所以项目级工单必须把寿命锚在项目级（issue/milestone/thread），PR 只是阶段产物——这是规则改动，不是 executor 代码改动。
+
 ## 3. 三种工作形态对比
 
 | 维度 | 临时工单 | 项目级工单（推荐承载持续工作） | 免工单转交（Team teammate） |
@@ -84,11 +99,13 @@
 - 协作规范：写域划分、成员上限（默认每队 8）、共享任务板（`team_task_*` + `write_scopes` + `blocked_by`）。
 - 决策：经典 `subagent` 与 Team 并存还是收敛到一种。
 
-### P2（策略/文档层）：定义「项目级工单」
+### P2（策略/文档层 + 少量代码）：定义「项目级工单」
 
-- 定义什么算工单：持续项目一个工单；只有出现「新的外部目标/新的完成锚」才拆新工单。
-- 生命周期规则：长工单如何报告进度、何时视为完成、何时该拆单；blocked/failed 后的恢复约定。
-- 队友在长工单内的处置：handoff 后队友休眠，下一轮由 lead 冷唤醒（先验证可达性）；若需要跨 handoff 持续存活，再评估对 `stopSubagents` 做豁免的小改动。
+- 定义什么算工单：持续项目一个工单；只有出现「新的外部目标/新的完成锚/新的授权」才拆新工单。
+- 项目级锚：用 issue/milestone/thread 定义工单寿命；完成 = 人宣布或里程碑关闭；PR 只是阶段产物。需要解耦现有「PR 关闭即结束工单」的规则。
+- 上下文纪律：文件为真源 + 阶段 checkpoint（工具结果会被 8192 字符截断，必须落文件）。
+- 队友在长工单内的处置：handoff 时 `stopSubagents` 会 drain 掉 worker 的 teammate（`src/executor/dsh.ts:588`、`src/executor/background.ts:141`）。两个选项：依赖 `send_message` 冷唤醒（continuable 语义，`dsh-subagent` 类型定义）或对 Team child 做豁免——二选一后再验证。
+- `workOnly` 的允许名单显式列出 Team 工具（当前靠「本地注册不被遮蔽」生效，显式列出更稳，且未来若 Team 工具改为继承注册也不会被误遮）。
 - 文档：更新 `docs/003-execution.md`（长工单与队友生命周期）、`docs/004-prompts.md`、`docs/006-deployment.md`、README/SETUP；如动 preset 需同步 `tests/bundle-patch.spec.ts`。
 
 ### P3（可选，默认不做）：跨工单常驻
@@ -97,7 +114,7 @@
 
 ## 5. 待拍板决策
 
-1. **工单粒度**：是否采用「项目级工单」（持续项目一个工单、里程碑推进、交付后释放）？拆单/完成判据怎么写？
+1. **工单粒度与项目级锚**：是否采用「项目级工单」（持续项目一个工单、issue/milestone/thread 定寿命、里程碑推进、交付后由人宣布完成）？拆单条件 = 新目标/新锚/新授权，是否认可？
 2. **主 Session 的 Team 权限**：禁用（guard/提示词）还是保留但补策略段？
 3. **上下文默认**：默认 fork、评审用 fresh？fork 的成本与假设继承偏差是否接受？
 4. **工具收敛**：经典 `subagent` 与 Team 并存，还是只保留一种？
@@ -106,4 +123,4 @@
 ## 6. 验证方法与限制
 
 - 验证方式：静态核对相关代码/配置，加实机创建 teammate 与消息往返；主 Session 工具表取自其持久化 model 请求头。
-- 限制：只在 DSH 0.2.1-rc.3 + 实验性 Agent Teams 上验证；未做进程重启后的成员恢复测试；工单内队友跨 handoff 的冷唤醒是代码推断，尚未实测；fork 的 token 成本未量化；项目级工单尚未落成规则。
+- 限制：只在 DSH 0.2.1-rc.3 + 实验性 Agent Teams 上验证；未做进程重启后的成员恢复测试；工单内队友跨 handoff 的冷唤醒是代码推断（continuable 语义支持，但未实测）；fork 的 token 成本未量化；项目级工单与「PR 关闭即结束」的解耦尚未落成规则。
