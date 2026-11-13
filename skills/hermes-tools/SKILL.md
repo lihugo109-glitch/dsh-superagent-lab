@@ -18,7 +18,7 @@ hmail 用法
   printf '%s' "$body" | /root/work/state/tools/hermes-port/hmail --subject <标题>
   /root/work/state/tools/hermes-port/hmail --subject <标题> --body-file <文件> [--html auto|none|<文件>] [--attach <文件>]...
 - 收件人固定为脚本内置的用户邮箱，没有 --to 参数；正文优先 --body，其次 --body-file，最后 stdin。
-- 默认 --html auto：正文经 Hermes 的 mail_html 排版成统一 HTML 外观（表格/结论条，纯文本版兜底），正文写简短中文摘要即可；--html none 发纯文本；--html <文件> 发现成 HTML。
+- 默认 --html auto：正文经 Hermes 的 mail_html 排版成统一 HTML 外观（表格/结论条，纯文本版兜底），正文写简短中文摘要即可；--html none 发纯文本；--html <文件> 发送自定义 HTML。
 - 长文（报告、文档、markdown、PR 说明）用 --body-file 发送全文；脚本从 WSL 侧读文件、经 UTF-8 stdin 交给 Windows Python，Linux 或 Windows 路径都支持。
 - 附件模式（--attach）会改走 Hermes 纯文本通道（HTML 发信入口不支持附件），此时 --html 被忽略并在 stderr 提示。
 - 退出码：0 成功；1 发送失败（SMTP）；2 参数/正文问题；127 依赖缺失；错误输出以 "hmail: " 开头。
