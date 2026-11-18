@@ -91,7 +91,7 @@
 
 ### 2.3 WSL2 隔离探针（本次已实测，2026-11-18）
 
-探针根目录：`research/probe-pi/`（HOME / `PI_CODING_AGENT_DIR` / TMPDIR 全部隔离，未触碰 `~/.pi`、`/root/.dsh`、3082 服务；可整体删除）。
+探针在本工单工作区的 `research/probe-pi/` 完成（不随本 PR 提交；HOME / `PI_CODING_AGENT_DIR` / TMPDIR 全部隔离，未触碰 `~/.pi`、`/root/.dsh`、3082 服务；可整体删除）。
 
 | 项 | 结果 |
 |---|---|
@@ -372,7 +372,7 @@ Pi worker（fresh context，树状会话）──► 受控工作目录 + state.
 |---|---|---|
 | Pi CLI | 1.5.2（2026-11-10），MIT，Node ≥22.19 | npm `@earendil-works/pi-coding-agent`；pi.dev；docs.pi.dev |
 | Pi 文档 | RPC / RPC Commands / SDK / Extensions / Skills / Packages / Session Format / Security / Windows / NVIDIA | docs.pi.dev/latest/* |
-| Pi 探针 | 安装 12s/160MB/123 包；help 322ms；RPC 0.27s；未真实调用 | `research/probe-pi/log.md`（本工单） |
+| Pi 探针 | 安装 12s/160MB/123 包；help 322ms；RPC 0.27s；未真实调用 | 本工单工作区 `research/probe-pi/log.md`（不随 PR 提交） |
 | DSH | 0.2.1-rc.3；vendor `pi-ai@1.4.0`（`dsh-llm-pi-ai`） | 本机 `/usr/local/lib/node_modules/@deepseek-ai/dsh` |
 | mattpocock/skills | v1.3.2（2026-10-29），MIT，327,073★，27 技能 | github.com/mattpocock/skills；Pi 探针 `get_commands` 实测 27/27 |
 | DSH MattSkills Deck | `dsh-mattpocock-skills-deck@1.9.0-beta.33`（2026-11-01），382★，约 16,989 下载/30 天 | npm；/tmp/plugins.json 快照 |
