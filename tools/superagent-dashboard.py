@@ -190,7 +190,8 @@ def render(data: dict, db_label: str) -> str:
         for t in items:
             report = report_of(t.get("assignments") or [])
             extra = " ".join(x for x in [pr_of(report), "等待输入" if needs_person(t) else ""] if x)
-            next_text = summary_line(report) if show_next else esc(str((t.get("ended") or {}).get("reason") or report.get("state") or ""))
+            next_text = (esc(summary_line(report)) if show_next
+                         else esc(str((t.get("ended") or {}).get("reason") or report.get("state") or "")))
             rows.append(
                 "<tr>"
                 f'<td style="padding:7px 8px;border-bottom:1px solid #eef0f2;vertical-align:top">'
